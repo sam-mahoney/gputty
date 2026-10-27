@@ -1,0 +1,174 @@
+<!doctype html>
+<html>
+<head>
+<meta charset="utf-8">
+<title>gputty</title>
+<style>
+  html, body { margin: 0; height: 100%; background: #000; color: #fff; font: 13px monospace; overflow: hidden; }
+  #tty { display: block; width: 100vw; height: calc(100vh - 32px); }
+  #bar { height: 32px; display: flex; gap: 16px; align-items: center; padding: 0 10px; background: #111; border-top: 1px solid #333; }
+</style>
+</head>
+<body>
+<canvas id="tty"></canvas>
+<div id="bar">
+  <label>speed <input id="speed" type="range" min="0" max="4.3" step="0.01" value="1.3"></label>
+  <label><input id="auto" type="checkbox" checked> auto</label>
+  <span id="stats"></span>
+</div>
+<script type="module">
+const FONT_PX = 14, MAX_LINES = 2000;
+const FIRST = 32, LAST = 126, ATLAS_COLS = 16; // printable ASCII only
+
+const $ = id => document.getElementById(id);
+const canvas = $('tty');
+
+if (!navigator.gpu) { document.body.textContent = 'WebGPU not supported in this browser'; throw 0; }
+const device = await (await navigator.gpu.requestAdapter()).requestDevice();
+const ctx = canvas.getContext('webgpu');
+const format = navigator.gpu.getPreferredCanvasFormat();
+ctx.configure({ device, format });
+
+// --- Glyph atlas: draw every character once with 2D canvas, upload as a texture.
+const dpr = devicePixelRatio || 1;
+const fontPx = Math.round(FONT_PX * dpr);
+const font = `${fontPx}px monospace`;
+const measure = new OffscreenCanvas(1, 1).getContext('2d');
+measure.font = font;
+const cellW = Math.ceil(measure.measureText('M').width);
+const cellH = Math.ceil(fontPx * 1.25);
+
+const glyphCount = LAST - FIRST + 1;
+const atlasW = ATLAS_COLS * cellW, atlasH = Math.ceil(glyphCount / ATLAS_COLS) * cellH;
+const atlasCanvas = new OffscreenCanvas(atlasW, atlasH);
+const a = atlasCanvas.getContext('2d');
+a.fillStyle = '#000'; a.fillRect(0, 0, atlasW, atlasH);
+a.fillStyle = '#fff'; a.font = font; a.textBaseline = 'top';
+for (let i = 0; i < glyphCount; i++) {
+  a.fillText(String.fromCharCode(FIRST + i), (i % ATLAS_COLS) * cellW, Math.floor(i / ATLAS_COLS) * cellH + (cellH - fontPx) / 2);
+}
+const atlas = device.createTexture({
+  size: [atlasW, atlasH], format: 'rgba8unorm',
+  usage: GPUTextureUsage.TEXTURE_BINDING | GPUTextureUsage.COPY_DST | GPUTextureUsage.RENDER_ATTACHMENT,
+});
+device.queue.copyExternalImageToTexture({ source: atlasCanvas }, { texture: atlas }, [atlasW, atlasH]);
+
+// --- One fullscreen triangle; the fragment shader works out which cell each pixel is in.
+const shader = device.createShaderModule({ code: /* wgsl */`
+  struct U { cell: vec2u, grid: vec2u, atlasCols: u32 }
+  @group(0) @binding(0) var<uniform> u: U;
+  @group(0) @binding(1) var<storage, read> cells: array<u32>;
+  @group(0) @binding(2) var atlas: texture_2d<f32>;
+
+  @vertex fn vs(@builtin(vertex_index) i: u32) -> @builtin(position) vec4f {
+    let p = vec2f(f32((i << 1u) & 2u), f32(i & 2u));
+    return vec4f(p * 2.0 - 1.0, 0.0, 1.0);
+  }
+
+  @fragment fn fs(@builtin(position) pos: vec4f) -> @location(0) vec4f {
+    let px = vec2u(pos.xy);
+    let cell = px / u.cell;
+    if (cell.x >= u.grid.x || cell.y >= u.grid.y) { return vec4f(0.0, 0.0, 0.0, 1.0); }
+    let g = cells[cell.y * u.grid.x + cell.x];
+    let origin = vec2u(g % u.atlasCols, g / u.atlasCols) * u.cell;
+    let v = textureLoad(atlas, origin + px % u.cell, 0).r;
+    return vec4f(v, v, v, 1.0);
+  }
+`});
+const pipeline = device.createRenderPipeline({
+  layout: 'auto',
+  vertex: { module: shader, entryPoint: 'vs' },
+  fragment: { module: shader, entryPoint: 'fs', targets: [{ format }] },
+  primitive: { topology: 'triangle-list' },
+});
+const uniforms = device.createBuffer({ size: 32, usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST });
+
+let cols, rows, grid, cellBuf, bindGroup, dirty = true;
+function resize() {
+  canvas.width = Math.max(1, Math.floor(canvas.clientWidth * dpr));
+  canvas.height = Math.max(1, Math.floor(canvas.clientHeight * dpr));
+  cols = Math.max(1, Math.floor(canvas.width / cellW));
+  rows = Math.max(1, Math.floor(canvas.height / cellH));
+  grid = new Uint32Array(cols * rows);
+  cellBuf?.destroy();
+  cellBuf = device.createBuffer({ size: grid.byteLength, usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST });
+  device.queue.writeBuffer(uniforms, 0, new Uint32Array([cellW, cellH, cols, rows, ATLAS_COLS, 0, 0, 0]));
+  bindGroup = device.createBindGroup({
+    layout: pipeline.getBindGroupLayout(0),
+    entries: [
+      { binding: 0, resource: { buffer: uniforms } },
+      { binding: 1, resource: { buffer: cellBuf } },
+      { binding: 2, resource: atlas.createView() },
+    ],
+  });
+  dirty = true;
+}
+resize();
+new ResizeObserver(resize).observe(canvas);
+
+// --- Lines -> cell grid -> GPU. Only the last `rows` lines are visible; no wrapping.
+const lines = [];
+let pending = [];
+const QMARK = '?'.charCodeAt(0) - FIRST;
+
+function draw() {
+  grid.fill(0);
+  const start = Math.max(0, lines.length - rows);
+  for (let r = 0; r < rows && start + r < lines.length; r++) {
+    const s = lines[start + r], n = Math.min(s.length, cols), base = r * cols;
+    for (let c = 0; c < n; c++) {
+      const code = s.charCodeAt(c);
+      grid[base + c] = code >= FIRST && code <= LAST ? code - FIRST : QMARK;
+    }
+  }
+  device.queue.writeBuffer(cellBuf, 0, grid);
+  const enc = device.createCommandEncoder();
+  const pass = enc.beginRenderPass({ colorAttachments: [{
+    view: ctx.getCurrentTexture().createView(), loadOp: 'clear', storeOp: 'store', clearValue: [0, 0, 0, 1],
+  }]});
+  pass.setPipeline(pipeline);
+  pass.setBindGroup(0, bindGroup);
+  pass.draw(3);
+  pass.end();
+  device.queue.submit([enc.finish()]);
+}
+
+// Drain everything that arrived since the last frame in one go: at 5000 lines/s
+// that's ~80 lines per frame but still a single upload + draw.
+let received = 0;
+function frame() {
+  if (pending.length) {
+    received += pending.length;
+    for (const l of pending.length > MAX_LINES ? pending.slice(-MAX_LINES) : pending) lines.push(l);
+    if (lines.length > MAX_LINES) lines.splice(0, lines.length - MAX_LINES);
+    pending = [];
+    dirty = true;
+  }
+  if (dirty) { draw(); dirty = false; }
+  requestAnimationFrame(frame);
+}
+requestAnimationFrame(frame);
+
+// --- Data stream + controls.
+let target = 0;
+const es = new EventSource('/stream');
+es.onmessage = e => pending.push(e.data);
+es.addEventListener('rate', e => {
+  target = +e.data;
+  if ($('auto').checked) $('speed').value = Math.log10(Math.max(1, target));
+});
+
+const send = () => fetch(`/control?rate=${Math.round(10 ** $('speed').value)}&auto=${$('auto').checked ? 1 : 0}`, { method: 'POST' });
+$('speed').oninput = () => { $('auto').checked = false; send(); };
+$('auto').onchange = send;
+
+let lastCount = 0, lastT = performance.now();
+setInterval(() => {
+  const now = performance.now();
+  const recv = (received - lastCount) / ((now - lastT) / 1000);
+  lastCount = received; lastT = now;
+  $('stats').textContent = `target ${target}/s · recv ${Math.round(recv)}/s · total ${received} · ${cols}x${rows}`;
+}, 500);
+</script>
+</body>
+</html>
