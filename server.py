@@ -11,9 +11,14 @@ from urllib.parse import parse_qs, urlparse
 HERE = Path(__file__).parent
 PORT = int(sys.argv[1]) if len(sys.argv) > 1 else 8000
 
-# Shared by all clients. "auto" sweeps the rate on a sine wave so the
-# renderer sees both trickles and floods without touching the slider.
-state = {"rate": 20.0, "auto": True}
+# Per-connection settings, keyed by a client-chosen id. "auto" sweeps the rate
+# on a sine wave so the renderer sees both trickles and floods without touching
+# the slider.
+clients = {}
+
+# Longest gap we'll make up for in one tick. If a write blocks (slow or paused
+# client) we drop the backlog instead of answering with an ever-bigger burst.
+MAX_CATCHUP = 0.05
 
 LEVELS = ["INFO"] * 6 + ["DEBUG"] * 3 + ["WARN", "ERROR"]
 SERVICES = ["api", "db", "auth", "cache", "worker", "scheduler"]
@@ -29,10 +34,10 @@ MESSAGES = [
 ]
 
 
-def current_rate():
-    if state["auto"]:
+def current_rate(settings):
+    if settings["auto"]:
         return 10 ** (2 + 1.7 * math.sin(time.time() / 6))  # ~2 .. ~5000 lines/s
-    return state["rate"]
+    return settings["rate"]
 
 
 def fake_line(n):
@@ -53,7 +58,7 @@ class Handler(BaseHTTPRequestHandler):
             self.end_headers()
             self.wfile.write(body)
         elif path == "/stream":
-            self.stream()
+            self.stream(parse_qs(urlparse(self.path).query).get("id", [""])[0])
         else:
             self.send_error(404)
 
@@ -61,15 +66,31 @@ class Handler(BaseHTTPRequestHandler):
         url = urlparse(self.path)
         if url.path != "/control":
             return self.send_error(404)
+        # A custom header can't be sent cross-origin without a CORS preflight,
+        # which we never approve, so other web pages can't drive this endpoint.
+        if self.headers.get("X-Gputty") != "1":
+            return self.send_error(403)
         q = parse_qs(url.query)
+        settings = clients.get(q.get("id", [""])[0])
+        if settings is None:
+            return self.send_error(404, "unknown stream id")
         if "rate" in q:
-            state["rate"] = max(1.0, min(20000.0, float(q["rate"][0])))
+            try:
+                rate = float(q["rate"][0])
+            except ValueError:
+                rate = math.nan
+            if not math.isfinite(rate):
+                return self.send_error(400, "rate must be a number")
+            settings["rate"] = max(1.0, min(20000.0, rate))
         if "auto" in q:
-            state["auto"] = q["auto"][0] == "1"
+            settings["auto"] = q["auto"][0] == "1"
         self.send_response(204)
         self.end_headers()
 
-    def stream(self):
+    def stream(self, client_id):
+        if not client_id:
+            return self.send_error(400, "missing id")
+        settings = clients[client_id] = {"rate": 20.0, "auto": True}
         self.send_response(200)
         self.send_header("Content-Type", "text/event-stream")
         self.send_header("Cache-Control", "no-cache")
@@ -81,10 +102,10 @@ class Handler(BaseHTTPRequestHandler):
             while True:
                 time.sleep(0.01)
                 now = time.monotonic()
-                rate = current_rate()
+                rate = current_rate(settings)
                 # Accumulate fractional lines so low rates (e.g. 2/s) still work
                 # with a 10ms tick, and high rates batch into one write.
-                owed += rate * (now - last)
+                owed += rate * min(now - last, MAX_CATCHUP)
                 last = now
                 chunks = []
                 for _ in range(int(owed)):
@@ -99,6 +120,10 @@ class Handler(BaseHTTPRequestHandler):
                     self.wfile.flush()
         except (BrokenPipeError, ConnectionResetError):
             pass
+        finally:
+            # A reconnect may already have replaced our entry; leave that one alone.
+            if clients.get(client_id) is settings:
+                del clients[client_id]
 
     def log_message(self, format, *args):  # silence per-request logging
         pass

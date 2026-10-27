@@ -6,7 +6,7 @@
 <style>
   html, body { margin: 0; height: 100%; background: #000; color: #fff; font: 13px monospace; overflow: hidden; }
   #tty { display: block; width: 100vw; height: calc(100vh - 32px); }
-  #bar { height: 32px; display: flex; gap: 16px; align-items: center; padding: 0 10px; background: #111; border-top: 1px solid #333; }
+  #bar { box-sizing: border-box; height: 32px; display: flex; gap: 16px; align-items: center; padding: 0 10px; background: #111; border-top: 1px solid #333; }
 </style>
 </head>
 <body>
@@ -23,35 +23,56 @@ const FIRST = 32, LAST = 126, ATLAS_COLS = 16; // printable ASCII only
 const $ = id => document.getElementById(id);
 const canvas = $('tty');
 
-if (!navigator.gpu) { document.body.textContent = 'WebGPU not supported in this browser'; throw 0; }
-const device = await (await navigator.gpu.requestAdapter()).requestDevice();
+function fail(msg, reloadOnClick = false) {
+  document.body.textContent = msg;
+  if (reloadOnClick) { document.body.style.cursor = 'pointer'; document.body.onclick = () => location.reload(); }
+}
+
+const adapter = await navigator.gpu?.requestAdapter();
+if (!adapter) { fail('WebGPU not supported in this browser (or no usable GPU adapter)'); throw 0; }
+const device = await adapter.requestDevice();
 const ctx = canvas.getContext('webgpu');
 const format = navigator.gpu.getPreferredCanvasFormat();
 ctx.configure({ device, format });
 
-// --- Glyph atlas: draw every character once with 2D canvas, upload as a texture.
-const dpr = devicePixelRatio || 1;
-const fontPx = Math.round(FONT_PX * dpr);
-const font = `${fontPx}px monospace`;
-const measure = new OffscreenCanvas(1, 1).getContext('2d');
-measure.font = font;
-const cellW = Math.ceil(measure.measureText('M').width);
-const cellH = Math.ceil(fontPx * 1.25);
-
-const glyphCount = LAST - FIRST + 1;
-const atlasW = ATLAS_COLS * cellW, atlasH = Math.ceil(glyphCount / ATLAS_COLS) * cellH;
-const atlasCanvas = new OffscreenCanvas(atlasW, atlasH);
-const a = atlasCanvas.getContext('2d');
-a.fillStyle = '#000'; a.fillRect(0, 0, atlasW, atlasH);
-a.fillStyle = '#fff'; a.font = font; a.textBaseline = 'top';
-for (let i = 0; i < glyphCount; i++) {
-  a.fillText(String.fromCharCode(FIRST + i), (i % ATLAS_COLS) * cellW, Math.floor(i / ATLAS_COLS) * cellH + (cellH - fontPx) / 2);
-}
-const atlas = device.createTexture({
-  size: [atlasW, atlasH], format: 'rgba8unorm',
-  usage: GPUTextureUsage.TEXTURE_BINDING | GPUTextureUsage.COPY_DST | GPUTextureUsage.RENDER_ATTACHMENT,
+let lost = false;
+device.lost.then(info => {
+  lost = true;
+  if (info.reason === 'destroyed') return;
+  es.close();
+  clearInterval(statsTimer);
+  fail(`GPU device lost${info.message ? `: ${info.message}` : ''}. Click to reload.`, true);
 });
-device.queue.copyExternalImageToTexture({ source: atlasCanvas }, { texture: atlas }, [atlasW, atlasH]);
+device.onuncapturederror = e => console.error('WebGPU error:', e.error.message);
+
+// --- Glyph atlas: draw every character once with 2D canvas, upload as a texture.
+// Rebuilt whenever devicePixelRatio changes (zoom, moving between displays).
+let dpr, cellW, cellH, atlas;
+function buildAtlas() {
+  dpr = devicePixelRatio || 1;
+  const fontPx = Math.round(FONT_PX * dpr);
+  const font = `${fontPx}px monospace`;
+  const measure = new OffscreenCanvas(1, 1).getContext('2d');
+  measure.font = font;
+  cellW = Math.ceil(measure.measureText('M').width);
+  cellH = Math.ceil(fontPx * 1.25);
+
+  const glyphCount = LAST - FIRST + 1;
+  const atlasW = ATLAS_COLS * cellW, atlasH = Math.ceil(glyphCount / ATLAS_COLS) * cellH;
+  const atlasCanvas = new OffscreenCanvas(atlasW, atlasH);
+  const a = atlasCanvas.getContext('2d');
+  a.fillStyle = '#000'; a.fillRect(0, 0, atlasW, atlasH);
+  a.fillStyle = '#fff'; a.font = font; a.textBaseline = 'top';
+  for (let i = 0; i < glyphCount; i++) {
+    a.fillText(String.fromCharCode(FIRST + i), (i % ATLAS_COLS) * cellW, Math.floor(i / ATLAS_COLS) * cellH + (cellH - fontPx) / 2);
+  }
+  atlas?.destroy();
+  atlas = device.createTexture({
+    size: [atlasW, atlasH], format: 'rgba8unorm',
+    usage: GPUTextureUsage.TEXTURE_BINDING | GPUTextureUsage.COPY_DST | GPUTextureUsage.RENDER_ATTACHMENT,
+  });
+  device.queue.copyExternalImageToTexture({ source: atlasCanvas }, { texture: atlas }, [atlasW, atlasH]);
+}
 
 // --- One fullscreen triangle; the fragment shader works out which cell each pixel is in.
 const shader = device.createShaderModule({ code: /* wgsl */`
@@ -85,6 +106,7 @@ const uniforms = device.createBuffer({ size: 32, usage: GPUBufferUsage.UNIFORM |
 
 let cols, rows, grid, cellBuf, bindGroup, dirty = true;
 function resize() {
+  if ((devicePixelRatio || 1) !== dpr) buildAtlas();
   canvas.width = Math.max(1, Math.floor(canvas.clientWidth * dpr));
   canvas.height = Math.max(1, Math.floor(canvas.clientHeight * dpr));
   cols = Math.max(1, Math.floor(canvas.width / cellW));
@@ -103,19 +125,27 @@ function resize() {
   });
   dirty = true;
 }
-resize();
+// The observer's first callback does the initial sizing.
 new ResizeObserver(resize).observe(canvas);
+// A DPR change doesn't always change the canvas's CSS size, so the observer may
+// not fire. A resolution media query matches only the current DPR; re-arm it each time.
+(function watchDpr() {
+  matchMedia(`(resolution: ${devicePixelRatio}dppx)`)
+    .addEventListener('change', () => { resize(); watchDpr(); }, { once: true });
+})();
 
 // --- Lines -> cell grid -> GPU. Only the last `rows` lines are visible; no wrapping.
-const lines = [];
-let pending = [];
+// Incoming lines go straight into a fixed ring, so memory stays bounded even
+// while a hidden tab isn't running requestAnimationFrame.
+const ring = new Array(MAX_LINES);
+let received = 0;
 const QMARK = '?'.charCodeAt(0) - FIRST;
 
 function draw() {
   grid.fill(0);
-  const start = Math.max(0, lines.length - rows);
-  for (let r = 0; r < rows && start + r < lines.length; r++) {
-    const s = lines[start + r], n = Math.min(s.length, cols), base = r * cols;
+  const visible = Math.min(rows, received, MAX_LINES), start = received - visible;
+  for (let r = 0; r < visible; r++) {
+    const s = ring[(start + r) % MAX_LINES], n = Math.min(s.length, cols), base = r * cols;
     for (let c = 0; c < n; c++) {
       const code = s.charCodeAt(c);
       grid[base + c] = code >= FIRST && code <= LAST ? code - FIRST : QMARK;
@@ -133,37 +163,36 @@ function draw() {
   device.queue.submit([enc.finish()]);
 }
 
-// Drain everything that arrived since the last frame in one go: at 5000 lines/s
+// Everything that arrived since the last frame is drawn in one go: at 5000 lines/s
 // that's ~80 lines per frame but still a single upload + draw.
-let received = 0;
 function frame() {
-  if (pending.length) {
-    received += pending.length;
-    for (const l of pending.length > MAX_LINES ? pending.slice(-MAX_LINES) : pending) lines.push(l);
-    if (lines.length > MAX_LINES) lines.splice(0, lines.length - MAX_LINES);
-    pending = [];
-    dirty = true;
-  }
-  if (dirty) { draw(); dirty = false; }
+  if (dirty && bindGroup && !lost) { draw(); dirty = false; }
   requestAnimationFrame(frame);
 }
 requestAnimationFrame(frame);
 
 // --- Data stream + controls.
+// Settings are per connection on the server, keyed by this id.
+const id = crypto.randomUUID();
 let target = 0;
-const es = new EventSource('/stream');
-es.onmessage = e => pending.push(e.data);
+const es = new EventSource(`/stream?id=${id}`);
+es.onmessage = e => { ring[received++ % MAX_LINES] = e.data; dirty = true; };
 es.addEventListener('rate', e => {
   target = +e.data;
   if ($('auto').checked) $('speed').value = Math.log10(Math.max(1, target));
 });
 
-const send = () => fetch(`/control?rate=${Math.round(10 ** $('speed').value)}&auto=${$('auto').checked ? 1 : 0}`, { method: 'POST' });
+const send = () => fetch(`/control?id=${id}&rate=${Math.round(10 ** $('speed').value)}&auto=${$('auto').checked ? 1 : 0}`, {
+  method: 'POST', headers: { 'X-Gputty': '1' },
+}).then(r => { if (!r.ok) console.warn('control rejected:', r.status); })
+  .catch(err => console.warn('control request failed:', err));
+// A (re)connect starts with server defaults, so push our current controls.
+es.onopen = send;
 $('speed').oninput = () => { $('auto').checked = false; send(); };
 $('auto').onchange = send;
 
 let lastCount = 0, lastT = performance.now();
-setInterval(() => {
+const statsTimer = setInterval(() => {
   const now = performance.now();
   const recv = (received - lastCount) / ((now - lastT) / 1000);
   lastCount = received; lastT = now;
